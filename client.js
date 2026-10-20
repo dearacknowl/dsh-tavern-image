@@ -2284,18 +2284,28 @@ function versionsOf(jobId) {
       // 从卡导入：卡列表 + 当前选中的卡
       const [importCards, setImportCards] = React.useState([])
       const [importCard, setImportCard] = React.useState('')
+      // 正在玩的卡（cards/x.json）；人物库默认只看这张卡
+      const [currentCardPath, setCurrentCardPath] = React.useState('')
+      // 人物库按卡筛选：'' = 跟随当前卡，'all' = 全部，'__unbound' = 只看未绑定，否则是卡路径
+      const [peopleCardFilter, setPeopleCardFilter] = React.useState('')
+      // 导入预览：{ card, cardName, items: [{ action, person, pick }], skippedMinors }
+      const [importPreview, setImportPreview] = React.useState(null)
+      const [peopleOverviewOpen, setPeopleOverviewOpen] = React.useState(false)
+      const [peopleTidyOpen, setPeopleTidyOpen] = React.useState(false)
       React.useEffect(() => {
         let alive = true
         ;(async () => {
           try {
-            const r = await post('/cards', {})
+            const r = await post('/cards', { sessionId: String(lastSessionId || '') })
             if (!alive) return
             const list = (r?.cards || []).map(item => ({
               path: item.path,
               label: item.title || item.name,
             }))
             setImportCards(list)
-            setImportCard(current => current || (list[0]?.path ?? ''))
+            const current = typeof r?.current === 'string' && list.some(item => item.path === r.current) ? r.current : ''
+            setCurrentCardPath(current)
+            setImportCard(existing => existing || current || (list[0]?.path ?? ''))
           } catch {}
         })()
         return () => { alive = false }
@@ -3158,9 +3168,29 @@ function versionsOf(jobId) {
         const characters = (data.definitions && data.definitions.characters) || []
         const picked = characters.filter(character => peoplePicked[character.id])
         const search = peopleSearch.trim().toLocaleLowerCase()
-        const filteredCharacters = (search
-          ? characters.filter(character => [character.name, character.match, character.group].some(value => String(value || '').toLocaleLowerCase().includes(search)))
-          : characters).slice().sort((a, b) => {
+        // —— 按卡归类 ——
+        const bareCard = value => String(value || '').replace(/^.*[\\/]/, '').replace(/\.json$/i, '')
+        const cardTitle = path => (importCards.find(item => bareCard(item.path) === bareCard(path))?.label) || bareCard(path)
+        const boundTo = (person, path) => (person.cards || []).some(entry => bareCard(entry) === bareCard(path))
+        const cardFilter = peopleCardFilter || (currentCardPath ? currentCardPath : 'all')
+        const onFilter = person => cardFilter === 'all' ? true
+          : cardFilter === '__unbound' ? !(person.cards || []).length
+          : (!(person.cards || []).length || boundTo(person, cardFilter))
+        const sectionOf = person => {
+          const cards = person.cards || []
+          if (!cards.length) return '未绑定（所有卡通用）'
+          if (cardFilter !== 'all' && cardFilter !== '__unbound') return '「' + cardTitle(cardFilter) + '」的人物'
+          return cards.length === 1 ? '「' + cardTitle(cards[0]) + '」的人物' : '多张卡共用'
+        }
+        // 「绑定到当前卡」用的目标：筛选选中的卡，其次正在玩的卡
+        const bindTarget = cardFilter !== 'all' && cardFilter !== '__unbound' ? cardFilter : currentCardPath
+        const filteredCharacters = characters.filter(onFilter).filter(character => !search || [character.name, character.match, character.group].some(value => String(value || '').toLocaleLowerCase().includes(search)))
+          .slice().sort((a, b) => {
+            const sa = sectionOf(a), sb = sectionOf(b)
+            if (sa !== sb) {
+              const rank = name => name.startsWith('未绑定') ? 2 : name === '多张卡共用' ? 1 : 0
+              return (rank(sa) - rank(sb)) || sa.localeCompare(sb, 'zh-CN')
+            }
             const ga = String(a.group || '').trim()
             const gb = String(b.group || '').trim()
             if (ga !== gb) {
@@ -3333,18 +3363,41 @@ function versionsOf(jobId) {
           }
         }
 
-        /** 从当前会话的世界书导入成年角色 */
+        /** 从选定的卡导入：先预览，勾选确认后才写入人物库 */
         async function importFromCard() {
           try {
             setNote('正在读取这张卡里的角色…')
-            const result = await post('/import-characters', { sessionId: String(lastSessionId || ''), card: importCard })
+            const result = await post('/import-characters', { sessionId: String(lastSessionId || ''), card: importCard, dryRun: true })
+            if (!result?.ok) throw new Error(result?.error || '读取失败')
+            const items = (result.candidates || []).map(item => ({ action: item.action, person: item.person, pick: item.action !== 'same' }))
+            setImportPreview({ card: importCard, cardName: result.cardName || cardTitleOf(importCard), items, skippedMinors: result.skippedMinors || [] })
+            setNote(items.length ? '先看一下要导入的人，勾选后点「确认导入」' : '这张卡里没有可导入的角色')
+            return result
+          } catch (error) {
+            const message = '导入失败：' + (error?.message ?? error)
+            setNote(message)
+            if (typeof showToast === 'function') showToast(message)
+            return null
+          }
+        }
+        function cardTitleOf(path) { return (importCards.find(item => item.path === path)?.label) || String(path || '').replace(/^.*\//, '').replace(/\.json$/i, '') }
+        async function confirmImport() {
+          const preview = importPreview
+          if (!preview) return null
+          const chosen = preview.items.filter(item => item.pick).map(item => item.person)
+          if (!chosen.length) { setNote('没有勾选要导入的人'); return null }
+          try {
+            setNote('正在导入…')
+            const result = await post('/import-characters', { sessionId: String(lastSessionId || ''), card: preview.card, apply: chosen })
+            if (!result?.ok) throw new Error(result?.error || '导入失败')
+            setImportPreview(null)
             if (result?.state) receiveState(result.state)
             const added = result?.added || []
             const updated = result?.updated || []
             const parts = []
             if (added.length) parts.push('新增 ' + added.join('、'))
             if (updated.length) parts.push('补全 ' + updated.join('、'))
-            const message = parts.length ? ('从选定的卡导入：' + parts.join('；')) : '这张卡里没有可导入的角色'
+            const message = parts.length ? ('从选定的卡导入：' + parts.join('；')) : '勾选的人和人物库里已有的一样，没有变化'
             setNote(message)
             if (typeof showToast === 'function') showToast(message)
             return result
@@ -3599,11 +3652,110 @@ function versionsOf(jobId) {
           )
         }
 
+        /** 把人物按「属于哪张卡」分段，段内保持原排序 */
+        function sectionsOf(list) {
+          const out = []
+          for (const person of list) {
+            const key = sectionOf(person)
+            const hit = out.find(([name]) => name === key)
+            if (hit) hit[1].push(person); else out.push([key, [person]])
+          }
+          return out
+        }
+        function bindToCard(person, path) {
+          if (!person || !path) return
+          setCharacters(current => current.map(item => item.id === person.id ? Object.assign({}, item, { cards: [...new Set([...(item.cards || []), path])] }) : item))
+          setNote('已把「' + (person.name || '未命名角色') + '」绑定到「' + cardTitle(path) + '」，记得点「保存人物库」')
+        }
+        function traitCount(person) {
+          const traits = person.traits || {}
+          return ["feature","face","faceBack","bodySFW","bodySFWBack","lowerSFW","lowerSFWBack","bodyNSFW","bodyNSFWBack","lowerNSFW","lowerNSFWBack","negative"].filter(k => String(traits[k] || '').trim()).length
+        }
+        function jumpTo(person) {
+          setPeopleSearch('')
+          if (!onFilter(person)) setPeopleCardFilter('all')
+          setPeopleActiveId(person.id)
+          setPeopleEditorOpen(true)
+        }
+
+        function importPreviewPanel() {
+          const preview = importPreview
+          if (!preview) return null
+          const label = { add: '新增', update: '补全空白项', same: '已有，无变化' }
+          const toggle = (index, pick) => setImportPreview(current => current && Object.assign({}, current, { items: current.items.map((item, k) => k === index ? Object.assign({}, item, { pick }) : item) }))
+          const count = preview.items.filter(item => item.pick).length
+          return h('div', { 'aria-label': '导入预览', style: Object.assign({}, S.card, { margin: '8px 0 12px', background: 'rgba(106,168,255,.05)' }) },
+            h('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '6px' } }, '从「' + preview.cardName + '」导入：先确认要哪些人'),
+            h('div', { style: { fontSize: '12px', color: '#9aa3b2', marginBottom: '6px' } }, '新增的人会自动绑定到这张卡；「补全」只填人物库里空着的项，不覆盖你改过的内容。'),
+            preview.items.length ? preview.items.map((item, index) => h('label', { key: index, style: { display: 'flex', alignItems: 'flex-start', gap: '8px', fontSize: '12px', padding: '4px 0', borderTop: index ? '1px solid #2c3240' : 'none' } },
+              h('input', { type: 'checkbox', 'aria-label': '导入 ' + item.person.name, checked: item.pick, onChange: event => toggle(index, event.target.checked) }),
+              h('span', { style: { minWidth: '72px', color: item.action === 'add' ? '#7fd17f' : item.action === 'update' ? '#f5c078' : '#9aa3b2' } }, label[item.action] || item.action),
+              h('span', { style: { fontWeight: 600, minWidth: '70px' } }, item.person.name),
+              h('span', { style: { color: '#9aa3b2' } }, String(item.person?.traits?.feature || item.person?.traits?.face || '').slice(0, 80)),
+            )) : h('div', { style: { fontSize: '12px', color: '#9aa3b2' } }, '这张卡里没有认出可导入的人物。'),
+            (preview.skippedMinors || []).length ? h('div', { style: { fontSize: '12px', color: '#9aa3b2', marginTop: '6px' } }, '已跳过（未满 18 岁，不建生图设定）：' + preview.skippedMinors.join('、')) : null,
+            h('div', { style: S.row },
+              h('button', { style: buttonStyle, disabled: !count, onClick: confirmImport }, count ? '确认导入 ' + count + ' 位' : '没有勾选'),
+              h('button', { style: buttonStyle, onClick: () => { setImportPreview(null); setNote('已取消导入') } }, '取消'),
+            ),
+          )
+        }
+
+        function overviewPanel() {
+          const list = filteredCharacters
+          return h('div', { 'aria-label': '人物概览', style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: '8px', margin: '8px 0 12px' } },
+            list.length ? list.map(person => {
+              const n = traitCount(person)
+              const outfits = (person.outfits || []).length
+              const cards = person.cards || []
+              const active = activeCharacter && activeCharacter.id === person.id
+              return h('button', { key: person.id, 'aria-label': '概览 ' + (person.name || '未命名角色'), onClick: () => { jumpTo(person); setPeopleOverviewOpen(false) },
+                style: { textAlign: 'left', padding: '8px 10px', borderRadius: '10px', cursor: 'pointer', color: 'inherit', background: active ? 'rgba(106,168,255,.14)' : 'rgba(255,255,255,.03)', border: '1px solid ' + (cards.length ? 'rgba(120,140,170,.25)' : 'rgba(240,166,60,.55)'), opacity: person.enabled === false ? 0.55 : 1 } },
+                h('div', { style: { fontSize: '13px', fontWeight: 600 } }, (person.name || '（未命名角色）') + (person.enabled === false ? '（停用）' : '')),
+                h('div', { style: { fontSize: '11px', color: n >= 6 ? '#9aa3b2' : '#f5c078', marginTop: '3px' } }, '外貌 ' + n + '/12 块 · ' + (outfits ? outfits + ' 套服装' : '没有服装')),
+                h('div', { style: { fontSize: '11px', color: cards.length ? '#9aa3b2' : '#f5c078', marginTop: '2px' } }, cards.length ? '绑定：' + cards.map(cardTitle).join('、').slice(0, 40) : '未绑定卡：所有卡都会用到'),
+              )
+            }) : h('div', { style: { fontSize: '12px', color: '#9aa3b2' } }, '当前筛选下没有人物'),
+          )
+        }
+
+        /** 整理：列出可能出问题的人物，可直接跳过去改或一键处理 */
+        function tidyPanel() {
+          const PLAYER = /^(你|我|玩家|主角|男主|女主|主人公|user|\{\{user\}\})$/i
+          const issues = []
+          const byName = new Map()
+          for (const person of characters) {
+            const name = String(person.name || '').trim()
+            if (name) byName.set(name, (byName.get(name) || 0) + 1)
+          }
+          for (const person of characters) {
+            const name = String(person.name || '').trim()
+            if (!name || PLAYER.test(name) || name.includes('{{user}}')) issues.push({ person, kind: 'player', text: name ? '像是玩家角色，不需要建生图设定' : '没有名字' })
+            if (!(person.cards || []).length) issues.push({ person, kind: 'unbound', text: '没绑定卡：所有卡的图里都可能出现' })
+            if (name && byName.get(name) > 1) issues.push({ person, kind: 'dup', text: '和另一位重名，生图时可能互相顶替' })
+            if (traitCount(person) < 3) issues.push({ person, kind: 'sparse', text: '外貌只填了 ' + traitCount(person) + ' 块，出图会不稳定' })
+          }
+          const remove = person => {
+            if (typeof confirm === 'function' && !confirm('删掉「' + (person.name || '未命名') + '」？')) return
+            setCharacters(current => current.filter(item => item.id !== person.id))
+          }
+          return h('div', { 'aria-label': '整理人物库', style: Object.assign({}, S.card, { margin: '8px 0 12px' }) },
+            h('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '6px' } }, issues.length ? '发现 ' + issues.length + ' 处可以整理的地方（看全部卡）' : '人物库很整齐，没有发现问题'),
+            issues.map((issue, index) => h('div', { key: issue.person.id + issue.kind, style: Object.assign({}, S.row, { borderTop: index ? '1px solid #2c3240' : 'none', paddingTop: '4px' }) },
+              h('button', { style: Object.assign({}, buttonStyle, { fontSize: '12px', minWidth: '90px' }), onClick: () => jumpTo(issue.person) }, issue.person.name || '（未命名角色）'),
+              h('span', { style: { fontSize: '12px', color: '#9aa3b2', flex: 1 } }, issue.text),
+              issue.kind === 'unbound' && bindTarget ? h('button', { style: Object.assign({}, buttonStyle, { fontSize: '12px' }), onClick: () => bindToCard(issue.person, bindTarget) }, '绑定到「' + cardTitle(bindTarget) + '」') : null,
+              issue.kind === 'player' ? h('button', { style: Object.assign({}, buttonStyle, { fontSize: '12px', borderColor: 'rgba(242,104,107,.65)', color: '#f2686b' }), onClick: () => remove(issue.person) }, '删除') : null,
+            )),
+            issues.length ? h('div', { style: { fontSize: '11px', color: '#9aa3b2', marginTop: '6px' } }, '处理完记得点「保存人物库」') : null,
+          )
+        }
+
         function characterBlock(c, i) {
           const traits = c.traits || {}
           const outfits = c.outfits || []
           const filled = ["feature","face","faceBack","bodySFW","bodySFWBack","lowerSFW","lowerSFWBack","bodyNSFW","bodyNSFWBack","lowerNSFW","lowerNSFWBack","negative"].filter(k => String(traits[k] || '').trim()).length
-          const title = (c.name || '（未命名角色）') + '　' + filled + '/12 块　' + (outfits.length ? outfits.length + ' 套服装' : '没有服装')
+          const title = (c.name || '（未命名角色）') + '　' + filled + '/12 块　' + (outfits.length ? outfits.length + ' 套服装' : '没有服装') + ((c.cards || []).length ? '' : '　⚠ 未绑定卡（所有卡都会用到）')
           const grouped = (list) => list.map(([key, label, why, rows, folded]) => area(label, why, traits[key], v => patchTraits(i, key, v), rows))
           return h('details', { key: c.id, open: peopleEditorOpen, onToggle: event => {
             const open = event.currentTarget.open
@@ -3647,6 +3799,10 @@ function versionsOf(jobId) {
                 },
               }, (c.cards || []).length ? ('已绑定 ' + (c.cards || []).length + ' 张：' + (c.cards || []).map(p => String(p).replace(/^cards\//, '').replace(/\.json$/, '')).join('、').slice(0, 26) + '（点击修改）') : '点这里选择要绑定的卡片（不选 = 所有卡都能用）'),
             ),
+            !(c.cards || []).length && bindTarget ? h('div', { style: S.row },
+              h('span', { style: { fontSize: '12px', color: '#f5c078' } }, '这个人没绑定卡，所有卡的图里都可能用到。'),
+              h('button', { style: Object.assign({}, buttonStyle, { fontSize: '12px' }), onClick: () => bindToCard(c, bindTarget) }, '绑定到「' + cardTitle(bindTarget) + '」'),
+            ) : null,
             cardPickerFor === c.id ? h('div', { style: { marginTop: '8px', padding: '10px 12px', borderRadius: '10px', background: 'rgba(255,255,255,.03)', border: '1px solid rgba(120,140,170,.2)' } },
               h('div', { style: { fontSize: '12px', color: '#9aa3b2', marginBottom: '8px' } }, '勾选要绑定的卡片（可多选）'),
               h('div', { style: { maxHeight: '220px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '4px' } },
@@ -3894,7 +4050,14 @@ function versionsOf(jobId) {
           h('div', { style: Object.assign({}, S.row, { alignItems: 'stretch' }) },
             h('input', { type: 'search', 'aria-label': '搜索角色', value: peopleSearch, placeholder: '搜索中文名或英文触发名', style: Object.assign({}, S.input, { flex: '1 1 220px', minWidth: '180px' }), onChange: event => setPeopleSearch(event.target.value) }),
             h('select', { 'aria-label': '当前角色', value: activeCharacter?.id || '', style: Object.assign({}, S.input, { flex: '1 1 220px', minWidth: '180px' }), onChange: event => { setPeopleActiveId(event.target.value); setPeopleEditorOpen(true) } },
-              activeCharacter ? filteredCharacters.map(character => h('option', { key: character.id, value: character.id, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, (character.group ? '[' + character.group + '] ' : '') + (character.name || '（未命名角色）') + (character.match ? ' · ' + character.match : ''))) : h('option', { value: '', style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, '没有匹配的角色'),
+              activeCharacter ? sectionsOf(filteredCharacters).map(([section, list]) => h('optgroup', { key: section, label: section },
+                list.map(character => h('option', { key: character.id, value: character.id, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, (character.group ? '[' + character.group + '] ' : '') + (character.name || '（未命名角色）') + (character.match ? ' · ' + character.match : ''))))) : h('option', { value: '', style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, '没有匹配的角色'),
+            ),
+            h('select', { 'aria-label': '按卡筛选人物', title: '只看某张卡能用到的人物（未绑定卡的人对所有卡都生效，总会列出来）', value: cardFilter, style: Object.assign({}, S.input, { flex: '0 1 200px', minWidth: '150px' }), onChange: event => setPeopleCardFilter(event.target.value) },
+              h('option', { value: 'all', style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, '全部卡'),
+              currentCardPath ? h('option', { value: currentCardPath, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, '当前卡：' + cardTitle(currentCardPath)) : null,
+              importCards.filter(item => item.path !== currentCardPath).map(item => h('option', { key: item.path, value: item.path, style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, item.label)),
+              h('option', { value: '__unbound', style: { color: 'CanvasText', backgroundColor: 'Canvas' } }, '只看未绑定的'),
             ),
             h('button', { style: buttonStyle, onClick: () => setPeopleEditorOpen(open => !open) }, peopleEditorOpen ? '收起编辑' : '展开编辑'),
           ),
@@ -3913,10 +4076,15 @@ function versionsOf(jobId) {
             h('button', { style: buttonStyle, onClick: designPeople }, '让 agent 设计角色'),
             h('button', { style: buttonStyle, disabled: saveState === 'saving', onClick: () => commit(false) }, saveState === 'saving' ? '正在保存…' : '保存人物库'),
             h('button', { style: buttonStyle, onClick: () => setPeopleBatchOpen(current => !current) }, peopleBatchOpen ? '收起批量编辑' : '批量编辑'),
+            h('button', { style: buttonStyle, onClick: () => setPeopleOverviewOpen(open => !open) }, peopleOverviewOpen ? '收起概览' : '概览'),
+            h('button', { style: buttonStyle, onClick: () => setPeopleTidyOpen(open => !open) }, peopleTidyOpen ? '收起整理' : '整理'),
             h('span', { style: { fontSize: '12px', color: '#9aa3b2' } }, '已选 ' + picked.length + ' / ' + characters.length + ' 位'),
           ),
           designPanel(),
+          importPreviewPanel(),
           batchPanel(),
+          peopleTidyOpen ? tidyPanel() : null,
+          peopleOverviewOpen ? overviewPanel() : null,
           !designOpen && designNote ? h('div', { role: 'status', style: { fontSize: '12px', color: '#9aa3b2', marginBottom: '8px' } }, designNote) : null,
           characters.length && !activeCharacter ? h('div', { role: 'status', style: { fontSize: '12px', color: '#9aa3b2', padding: '10px 0' } }, '没有匹配的角色，请调整搜索词。') : null,
           !characters.length ? h('div', { style: { fontSize: '12px', color: '#9aa3b2' } }, '还没有角色，点上方「新增角色」。') : null,

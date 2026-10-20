@@ -62,3 +62,16 @@ test('从选定的卡导入只读那张卡：不带入最近玩过的别的卡�
   assert.deepEqual(saved[0].cards, ['cards/a.json'])
 })
 
+test('导入预览不写人物库；确认时只写送回的候选，并重新跳过未成年、绑定到这张卡', async t => {
+  const f = await runtime(t)
+  const preview = await f.request('import-characters', { card: 'cards/a.json', dryRun: true })
+  assert.equal(preview.body.preview, true)
+  assert.deepEqual(preview.body.candidates.map(c => [c.action, c.person.name]), [['add', '林晚']])
+  assert.deepEqual(preview.body.skippedMinors, ['周屿'])
+  assert.deepEqual(JSON.parse(await readFile(join(f.root, 'definitions.json'), 'utf8')).characters, [])
+  const minor = { name: '周屿', traits: { feature: '16岁，高中生' } }
+  const r = await f.request('import-characters', { card: 'cards/a.json', apply: [preview.body.candidates[0].person, minor] })
+  assert.deepEqual(r.body.added, ['林晚'])
+  const saved = JSON.parse(await readFile(join(f.root, 'definitions.json'), 'utf8')).characters
+  assert.deepEqual(saved.map(c => [c.name, c.cards]), [['林晚', ['cards/a.json']]])
+})

@@ -789,12 +789,12 @@ test('搜索按角色名和英文触发名过滤；无匹配空态不删除角�
 
   search.props.onChange({ target: { value: '乙主' } }); ui.render()
   let selector = ui.input('当前角色')
-  assert.deepEqual(selector.children.map(option => option.props.value), ['b'])
+  assert.deepEqual(ui.nodes(selector).filter(node => node.type === 'option').map(option => option.props.value), ['b'])
   assert.deepEqual(ui.rolePanels().map(panel => panel.props.key), ['b'])
 
   ui.input('搜索角色').props.onChange({ target: { value: 'yiren' } }); ui.render()
   selector = ui.input('当前角色')
-  assert.deepEqual(selector.children.map(option => option.props.value), ['b'])
+  assert.deepEqual(ui.nodes(selector).filter(node => node.type === 'option').map(option => option.props.value), ['b'])
   assert.deepEqual(ui.rolePanels().map(panel => panel.props.key), ['b'])
 
   ui.input('搜索角色').props.onChange({ target: { value: '不存在' } }); ui.render()
@@ -1299,4 +1299,77 @@ test('按部位复制：放进已有的一套，可覆盖或追加；整套勾�
   ui.button('复制 1 个部位到这套').props.onClick(); ui.render()
   await ui.button('保存人物库').props.onClick(); ui.render()
   assert.equal(ui.state.definitions.characters[1].outfits[0].accessory, '草帽')
+})
+
+const cardsReply = () => ({ ok: true, cards: [{ path: 'cards/a.json', name: 'a', title: '甲卡' }, { path: 'cards/b.json', name: 'b', title: '乙卡' }], current: 'cards/a.json' })
+
+test('人物库默认只看当前卡（含未绑定），按卡分段；可切换全部/只看未绑定；未绑定的人可一键绑定到当前卡', async () => {
+  const chars = [Object.assign(person('x', '小甲'), { cards: ['cards/a.json'] }), Object.assign(person('y', '小乙'), { cards: ['cards/b.json'] }), person('z', '路人')]
+  const ui = harness({ cards: cardsReply }, chars)
+  await ui.ready()
+  const values = () => ui.nodes(ui.input('当前角色')).filter(node => node.type === 'option').map(option => option.props.value)
+  const groups = () => ui.nodes(ui.input('当前角色')).filter(node => node.type === 'optgroup').map(group => group.props.label)
+  assert.equal(ui.input('按卡筛选人物').props.value, 'cards/a.json')
+  assert.deepEqual(values(), ['x', 'z'])
+  assert.deepEqual(groups(), ['「甲卡」的人物', '未绑定（所有卡通用）'])
+  ui.input('按卡筛选人物').props.onChange({ target: { value: 'all' } }); ui.render()
+  assert.deepEqual(values(), ['x', 'y', 'z'])
+  ui.input('按卡筛选人物').props.onChange({ target: { value: '__unbound' } }); ui.render()
+  assert.deepEqual(values(), ['z'])
+  assert.match(ui.text(ui.role('z')), /未绑定卡/)
+  ui.button('绑定到「甲卡」').props.onClick(); ui.render()
+  await ui.button('保存人物库').props.onClick(); ui.render()
+  assert.deepEqual(ui.state.definitions.characters.find(c => c.id === 'z').cards, ['cards/a.json'])
+})
+
+test('从选定的卡导入先预览：可取消勾选，确认后只把勾选的候选送回后台写入', async () => {
+  const calls = []
+  const ui = harness({
+    cards: cardsReply,
+    'import-characters': ({ body, state, setState }) => {
+      calls.push(body)
+      if (body.dryRun) return { ok: true, preview: true, cardName: '甲卡', skippedMinors: ['周屿'], candidates: [
+        { action: 'add', person: { name: '林晚', traits: { feature: '黑色长发' } } },
+        { action: 'add', person: { name: '沈月', traits: { feature: '银色短发' } } },
+        { action: 'same', person: { name: '甲', traits: {} } },
+      ] }
+      const next = { ...state, definitions: { ...state.definitions, characters: state.definitions.characters.concat(body.apply.map((p, k) => ({ ...person('n' + k, p.name), cards: [body.card] }))) } }
+      setState(next)
+      return { ok: true, added: body.apply.map(p => p.name), updated: [], state: next }
+    },
+  })
+  await ui.ready()
+  ui.button('从选定的卡导入').props.onClick(); await flush(); ui.render()
+  assert.equal(calls[0].dryRun, true)
+  assert.equal(calls[0].card, 'cards/a.json')
+  assert.match(ui.text(ui.input('导入预览')), /周屿/)
+  assert.equal(ui.input('导入 甲').props.checked, false)
+  ui.input('导入 沈月').props.onChange({ target: { checked: false } }); ui.render()
+  ui.button('确认导入 1 位').props.onClick(); await flush(); ui.render()
+  assert.deepEqual(calls[1].apply.map(p => p.name), ['林晚'])
+  assert.equal(calls[1].dryRun, undefined)
+  assert.equal(ui.nodes(ui.render()).some(node => node.props?.['aria-label'] === '导入预览'), false)
+  assert.ok(ui.state.definitions.characters.some(c => c.name === '林晚'))
+})
+
+test('整理列出玩家角色、未绑定、重名、外貌空白；概览卡片点击切到该人物', async () => {
+  const full = { feature: 'a', face: 'b', faceBack: 'c', bodySFW: 'd' }
+  const chars = [Object.assign(person('p', '你'), { cards: ['cards/a.json'] }), Object.assign(person('d1', '阿梅'), { cards: ['cards/a.json'], traits: full }), Object.assign(person('d2', '阿梅'), { cards: ['cards/a.json'], traits: full }), Object.assign(person('u', '路人'), { traits: full })]
+  const ui = harness({ cards: cardsReply }, chars)
+  await ui.ready()
+  ui.button('整理').props.onClick(); ui.render()
+  const text = ui.text(ui.input('整理人物库'))
+  assert.match(text, /像是玩家角色/)
+  assert.match(text, /重名/)
+  assert.match(text, /没绑定卡/)
+  assert.match(text, /外貌只填了/)
+  ui.nodes(ui.input('整理人物库')).find(node => node.type === 'button' && ui.text(node) === '删除').props.onClick(); ui.render()
+  ui.nodes(ui.input('整理人物库')).find(node => node.type === 'button' && ui.text(node) === '绑定到「甲卡」').props.onClick(); ui.render()
+  await ui.button('保存人物库').props.onClick(); ui.render()
+  assert.equal(ui.state.definitions.characters.some(c => c.name === '你'), false)
+  assert.deepEqual(ui.state.definitions.characters.find(c => c.id === 'u').cards, ['cards/a.json'])
+
+  ui.button('概览').props.onClick(); ui.render()
+  ui.input('概览 路人').props.onClick(); ui.render()
+  assert.equal(ui.input('当前角色').props.value, 'u')
 })
